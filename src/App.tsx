@@ -26,6 +26,11 @@ import { SimpleDeviceRadar } from './components/SimpleDeviceRadar';
 import { SimpleTransferCard } from './components/SimpleTransferCard';
 import { SimpleIncomingModal } from './components/SimpleIncomingModal';
 import { SimpleQRModal } from './components/SimpleQRModal';
+import {
+  scanBluetoothDevice,
+  streamFileOverBluetooth,
+  BluetoothDeviceInfo,
+} from './utils/bluetooth';
 import { UploadCloud } from 'lucide-react';
 
 export default function App() {
@@ -66,6 +71,33 @@ export default function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const activeSessionRef = useRef<TransferSession | null>(null);
   activeSessionRef.current = transferSession;
+  const bluetoothDevicesRef = useRef<Map<string, BluetoothDeviceInfo>>(new Map());
+
+  // Bluetooth Scanner
+  const handleScanBluetooth = async () => {
+    try {
+      const dev = await scanBluetoothDevice();
+      if (dev) {
+        const newPeer: PeerInfo = {
+          peerId: 'bt-' + dev.id,
+          name: dev.name || 'Dispositivo Bluetooth',
+          deviceType: 'mobile',
+          os: 'other',
+          roomCode,
+          transportType: 'bluetooth',
+          joinedAt: Date.now(),
+        };
+        bluetoothDevicesRef.current.set(newPeer.peerId, dev);
+        setPeers((prev) => {
+          const exists = prev.some((p) => p.peerId === newPeer.peerId);
+          return exists ? prev : [newPeer, ...prev];
+        });
+        playRadarPing();
+      }
+    } catch (err: any) {
+      alert(err.message || 'No se pudo conectar al dispositivo Bluetooth');
+    }
+  };
 
   // Share URL for mobile QR pairing
   const shareUrl = typeof window !== 'undefined'
@@ -393,6 +425,78 @@ export default function App() {
     }
   };
 
+  // Bluetooth Streamer
+  const startSendingBluetoothFiles = async (
+    session: TransferSession,
+    btDevice: BluetoothDeviceInfo,
+    files: File[]
+  ) => {
+    let totalBytesSent = 0;
+    let lastTime = Date.now();
+
+    try {
+      for (let fIdx = 0; fIdx < files.length; fIdx++) {
+        if (activeSessionRef.current?.status === 'cancelled') return;
+        const file = files[fIdx];
+        const prevOffset = totalBytesSent;
+
+        await streamFileOverBluetooth(
+          btDevice,
+          file,
+          (fileBytesSent, _fileTotal) => {
+            const currentTotalSent = prevOffset + fileBytesSent;
+            const now = Date.now();
+            const delta = (now - lastTime) / 1000;
+            if (delta >= 0.25) {
+              const speedBps = (currentTotalSent - totalBytesSent) / (delta || 1);
+              const remainingBytes = Math.max(0, session.totalSize - currentTotalSent);
+              const etaSeconds = speedBps > 0 ? remainingBytes / speedBps : 0;
+
+              setTransferSession((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      currentFileIndex: fIdx,
+                      transferredBytes: currentTotalSent,
+                      speedBps,
+                      etaSeconds,
+                    }
+                  : null
+              );
+              lastTime = now;
+              totalBytesSent = currentTotalSent;
+            }
+          }
+        );
+        totalBytesSent = prevOffset + file.size;
+      }
+
+      setTransferSession((prev) =>
+        prev
+          ? {
+              ...prev,
+              status: 'completed',
+              transferredBytes: session.totalSize,
+              speedBps: 0,
+              etaSeconds: 0,
+            }
+          : null
+      );
+      playSuccessChime();
+    } catch (err: any) {
+      console.error('Bluetooth transfer error:', err);
+      setTransferSession((prev) =>
+        prev
+          ? {
+              ...prev,
+              status: 'error',
+              errorMessage: err?.message || 'Error en la transferencia Bluetooth',
+            }
+          : null
+      );
+    }
+  };
+
   // Initiate transfer request
   const initiateTransferWithFiles = (peer: PeerInfo, files: File[]) => {
     pendingFilesRef.current = files;
@@ -404,6 +508,10 @@ export default function App() {
       size: f.size,
       type: f.type || 'application/octet-stream',
     }));
+
+    const isBt =
+      peer.transportType === 'bluetooth' ||
+      bluetoothDevicesRef.current.has(peer.peerId);
 
     const session: TransferSession = {
       id: transferId,
@@ -419,13 +527,21 @@ export default function App() {
       speedBps: 0,
       etaSeconds: 0,
       startTime: Date.now(),
-      status: 'waiting_accept',
+      status: isBt ? 'transferring' : 'waiting_accept',
       isEncrypted: false,
       authFingerprint: '',
-      transport: 'webrtc',
+      transport: isBt ? 'bluetooth' : 'webrtc',
     };
 
     setTransferSession(session);
+
+    if (isBt) {
+      const btDevice = bluetoothDevicesRef.current.get(peer.peerId);
+      if (btDevice) {
+        startSendingBluetoothFiles(session, btDevice, files);
+      }
+      return;
+    }
 
     // Send transfer request via unified signaling
     sendSignaling(peer.peerId, {
@@ -990,6 +1106,7 @@ export default function App() {
         isMuted={isMutedState}
         onToggleMute={handleToggleMute}
         onOpenQR={() => setIsQROpen(true)}
+        onScanBluetooth={handleScanBluetooth}
         peersCount={peers.length}
       />
 
@@ -1006,6 +1123,7 @@ export default function App() {
           onDeviceClick={handleDeviceClick}
           onDropOnDevice={handleDropOnDevice}
           onOpenQR={() => setIsQROpen(true)}
+          onScanBluetooth={handleScanBluetooth}
           shareUrl={shareUrl}
         />
       </main>

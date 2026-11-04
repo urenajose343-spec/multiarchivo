@@ -31,7 +31,11 @@ export function SimpleTransferCard({
         {/* Top row */}
         <div className="flex items-center justify-between mb-2.5">
           <div className="flex items-center gap-2">
-            {session.direction === 'send' ? (
+            {session.transport === 'bluetooth' ? (
+              <div className="w-6 h-6 rounded-lg bg-blue-500/20 text-blue-400 flex items-center justify-center">
+                <span className="font-bold text-[11px]">BT</span>
+              </div>
+            ) : session.direction === 'send' ? (
               <div className="w-6 h-6 rounded-lg bg-cyan-500/20 text-cyan-400 flex items-center justify-center">
                 <ArrowUpRight className="w-3.5 h-3.5" />
               </div>

@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Radio, Volume2, VolumeX, QrCode, Edit2, Check } from 'lucide-react';
+import { Radio, Volume2, VolumeX, QrCode, Edit2, Check, Bluetooth } from 'lucide-react';
 import { DeviceOS, DeviceType } from '../types';
 import { DeviceIcon } from './DeviceIcons';
 
@@ -11,6 +11,7 @@ interface SimpleHeaderProps {
   isMuted: boolean;
   onToggleMute: () => void;
   onOpenQR: () => void;
+  onScanBluetooth: () => void;
   peersCount: number;
 }
 
@@ -22,6 +23,7 @@ export function SimpleHeader({
   isMuted,
   onToggleMute,
   onOpenQR,
+  onScanBluetooth,
 }: SimpleHeaderProps) {
   const [isEditing, setIsEditing] = useState(false);
   const [tempName, setTempName] = useState(deviceName);
@@ -84,22 +86,31 @@ export function SimpleHeader({
           )}
         </div>
 
-        {/* Right Actions */}
+        {/* Right Actions: Bluetooth + QR + Mute */}
         <div className="flex items-center gap-2">
+          <button
+            onClick={onScanBluetooth}
+            title="Escanear dispositivos por Bluetooth"
+            className="px-2.5 py-1 rounded-lg bg-neutral-900 hover:bg-neutral-850 border border-neutral-800 text-xs font-medium text-neutral-300 hover:text-blue-400 flex items-center gap-1.5 transition-colors cursor-pointer"
+          >
+            <Bluetooth className="w-3.5 h-3.5 text-blue-400" />
+            <span className="hidden sm:inline">Bluetooth</span>
+          </button>
+
+          <button
+            onClick={onOpenQR}
+            className="px-2.5 py-1 rounded-lg bg-neutral-900 hover:bg-neutral-850 border border-neutral-800 text-xs font-medium text-neutral-300 hover:text-white flex items-center gap-1.5 transition-colors cursor-pointer"
+          >
+            <QrCode className="w-3.5 h-3.5 text-cyan-400" />
+            <span className="hidden sm:inline">Conectar</span>
+          </button>
+
           <button
             onClick={onToggleMute}
             title={isMuted ? 'Activar sonido' : 'Silenciar'}
             className="w-7 h-7 rounded-lg text-neutral-400 hover:text-white hover:bg-neutral-900 flex items-center justify-center transition-colors cursor-pointer"
           >
             {isMuted ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
-          </button>
-
-          <button
-            onClick={onOpenQR}
-            className="px-3 py-1 rounded-lg bg-neutral-900 hover:bg-neutral-850 border border-neutral-800 text-xs font-medium text-neutral-200 hover:text-white flex items-center gap-1.5 transition-colors cursor-pointer"
-          >
-            <QrCode className="w-3.5 h-3.5 text-cyan-400" />
-            <span>Conectar</span>
           </button>
         </div>
       </div>

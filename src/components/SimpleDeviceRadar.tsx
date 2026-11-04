@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { PeerInfo, DeviceOS, DeviceType } from '../types';
 import { DeviceIcon } from './DeviceIcons';
-import { QrCode, Copy, Check, Smartphone, ArrowUpRight } from 'lucide-react';
+import { QrCode, Copy, Check, Smartphone, Bluetooth } from 'lucide-react';
 import QRCode from 'qrcode';
 
 interface SimpleDeviceRadarProps {
@@ -15,6 +15,7 @@ interface SimpleDeviceRadarProps {
   onDeviceClick: (peer: PeerInfo) => void;
   onDropOnDevice: (peer: PeerInfo, files: FileList) => void;
   onOpenQR: () => void;
+  onScanBluetooth: () => void;
   shareUrl: string;
 }
 
@@ -24,6 +25,7 @@ export function SimpleDeviceRadar({
   onDeviceClick,
   onDropOnDevice,
   onOpenQR,
+  onScanBluetooth,
   shareUrl,
 }: SimpleDeviceRadarProps) {
   const [dragOverPeerId, setDragOverPeerId] = useState<string | null>(null);
@@ -62,6 +64,7 @@ export function SimpleDeviceRadar({
           <div className="flex flex-wrap items-center justify-center gap-8">
             {peers.map((peer) => {
               const isOver = dragOverPeerId === peer.peerId;
+              const isBt = peer.transportType === 'bluetooth';
 
               return (
                 <div
@@ -83,16 +86,27 @@ export function SimpleDeviceRadar({
                 >
                   {/* AirDrop Device Circle */}
                   <div
-                    className={`w-24 h-24 sm:w-28 sm:h-28 rounded-full flex items-center justify-center transition-all duration-200 backdrop-blur-md ${
+                    className={`relative w-24 h-24 sm:w-28 sm:h-28 rounded-full flex items-center justify-center transition-all duration-200 backdrop-blur-md ${
                       isOver
                         ? 'bg-cyan-500/20 border-2 border-cyan-400 scale-105 shadow-xl shadow-cyan-500/30'
                         : 'bg-neutral-900 border border-neutral-700/80 group-hover:border-cyan-400 group-hover:bg-neutral-850 shadow-lg shadow-black/40'
                     }`}
                   >
+                    {isBt && (
+                      <div
+                        className="absolute top-1.5 right-1.5 w-6 h-6 rounded-full bg-blue-500/20 text-blue-400 flex items-center justify-center border border-blue-500/40"
+                        title="Conectado por Bluetooth BLE"
+                      >
+                        <Bluetooth className="w-3 h-3" />
+                      </div>
+                    )}
+
                     <div
                       className={`transition-colors ${
                         isOver
                           ? 'text-cyan-300'
+                          : isBt
+                          ? 'text-blue-300 group-hover:text-blue-400'
                           : 'text-neutral-200 group-hover:text-cyan-400'
                       }`}
                     >
@@ -111,6 +125,16 @@ export function SimpleDeviceRadar({
                 </div>
               );
             })}
+          </div>
+
+          <div className="mt-10 flex items-center gap-3">
+            <button
+              onClick={onScanBluetooth}
+              className="px-3 py-1.5 rounded-lg text-xs font-medium text-neutral-400 hover:text-blue-400 hover:bg-neutral-900 transition-colors flex items-center gap-1.5 cursor-pointer"
+            >
+              <Bluetooth className="w-3.5 h-3.5 text-blue-400" />
+              <span>Buscar por Bluetooth</span>
+            </button>
           </div>
         </div>
       ) : (
@@ -135,11 +159,39 @@ export function SimpleDeviceRadar({
             Buscando dispositivos cercanos...
           </p>
           <p className="text-xs text-neutral-500 mt-1 max-w-xs">
-            Abre este enlace en tu otro dispositivo para transferir archivos al instante:
+            Abre este enlace en tu otro dispositivo o busca por Bluetooth:
           </p>
 
+          {/* Quick Actions Row */}
+          <div className="mt-4 flex items-center gap-2">
+            <button
+              onClick={onScanBluetooth}
+              className="px-3.5 py-1.5 rounded-xl bg-neutral-900 hover:bg-neutral-850 border border-neutral-800 text-xs font-medium text-neutral-200 hover:text-blue-400 flex items-center gap-1.5 transition-colors cursor-pointer"
+            >
+              <Bluetooth className="w-3.5 h-3.5 text-blue-400" />
+              <span>Buscar por Bluetooth</span>
+            </button>
+
+            <button
+              onClick={handleCopy}
+              className="px-3 py-1.5 rounded-xl border border-neutral-800 bg-neutral-900/60 text-xs text-neutral-400 hover:text-white flex items-center gap-1.5 transition-colors cursor-pointer"
+            >
+              {copied ? (
+                <>
+                  <Check className="w-3 h-3 text-emerald-400" />
+                  <span className="text-emerald-400">¡Copiado!</span>
+                </>
+              ) : (
+                <>
+                  <Copy className="w-3 h-3" />
+                  <span>Copiar enlace</span>
+                </>
+              )}
+            </button>
+          </div>
+
           {/* Clean QR code */}
-          <div className="mt-5 p-3.5 bg-neutral-900 border border-neutral-800 rounded-2xl flex flex-col items-center">
+          <div className="mt-4 p-3.5 bg-neutral-900 border border-neutral-800 rounded-2xl flex flex-col items-center">
             {inlineQrUrl ? (
               <div
                 className="p-2 bg-white rounded-xl shadow-inner cursor-pointer"
@@ -158,24 +210,6 @@ export function SimpleDeviceRadar({
               <span>Escanea con la cámara de tu móvil</span>
             </p>
           </div>
-
-          {/* Copy link button */}
-          <button
-            onClick={handleCopy}
-            className="mt-3 px-3 py-1.5 rounded-lg text-xs text-neutral-400 hover:text-white hover:bg-neutral-900 transition-colors flex items-center gap-1.5 cursor-pointer"
-          >
-            {copied ? (
-              <>
-                <Check className="w-3 h-3 text-emerald-400" />
-                <span className="text-emerald-400">¡Enlace copiado!</span>
-              </>
-            ) : (
-              <>
-                <Copy className="w-3 h-3" />
-                <span>Copiar enlace</span>
-              </>
-            )}
-          </button>
         </div>
       )}
     </div>
