@@ -1,12 +1,10 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   DeviceOS,
   DeviceType,
   PeerInfo,
-  StagedFile,
   TransferSession,
   IncomingTransferRequest,
-  CloudVaultFile,
 } from './types';
 import {
   detectDevice,
@@ -14,13 +12,6 @@ import {
   getStoredDeviceName,
   setStoredDeviceName,
 } from './utils/device';
-import {
-  computeFileHash,
-  generateSecurityFingerprint,
-  deriveKey,
-  encryptChunk,
-  decryptChunk,
-} from './utils/crypto';
 import {
   playRadarPing,
   playRequestChime,
@@ -30,26 +21,23 @@ import {
   setMuted,
 } from './utils/audio';
 import { WebRTCConnection, CHUNK_SIZE } from './utils/webrtcClient';
-import { Header } from './components/Header';
-import { RadarView } from './components/RadarView';
-import { FileStaging } from './components/FileStaging';
-import { TransferModal } from './components/TransferModal';
-import { IncomingModal } from './components/IncomingModal';
-import { CloudVaultDrawer } from './components/CloudVaultDrawer';
-import { PairingModal } from './components/PairingModal';
-import { SettingsModal } from './components/SettingsModal';
-import { Radio, Cloud, ShieldCheck, Zap, DownloadCloud } from 'lucide-react';
+import { SimpleHeader } from './components/SimpleHeader';
+import { SimpleDeviceRadar } from './components/SimpleDeviceRadar';
+import { SimpleTransferCard } from './components/SimpleTransferCard';
+import { SimpleIncomingModal } from './components/SimpleIncomingModal';
+import { SimpleQRModal } from './components/SimpleQRModal';
+import { UploadCloud } from 'lucide-react';
 
 export default function App() {
-  // Device & Identity
+  // Device Detection & Stored Name
   const [deviceInfo] = useState(() => detectDevice());
   const [peerId] = useState(() => getOrCreatePeerId());
   const [deviceName, setDeviceName] = useState(() =>
     getStoredDeviceName(deviceInfo.defaultName)
   );
 
-  // Room code from URL param or default
-  const [roomCode, setRoomCode] = useState(() => {
+  // Room code: default to 'global' so any two devices opening the link connect immediately!
+  const [roomCode] = useState(() => {
     if (typeof window !== 'undefined') {
       const params = new URLSearchParams(window.location.search);
       const roomParam = params.get('room');
@@ -57,38 +45,32 @@ export default function App() {
         return roomParam.trim().toUpperCase();
       }
     }
-    return 'DROP-' + Math.floor(100 + Math.random() * 900);
+    return 'global';
   });
 
-  // UI Navigation & View State
-  const [activeTab, setActiveTab] = useState<'radar' | 'vault'>('radar');
+  // State
+  const [peers, setPeers] = useState<PeerInfo[]>([]);
   const [isMutedState, setIsMutedState] = useState(() => getMuted());
-  const [isPairingOpen, setIsPairingOpen] = useState(false);
-  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isQROpen, setIsQROpen] = useState(false);
   const [isDraggingOverScreen, setIsDraggingOverScreen] = useState(false);
 
-  // Peers & Staged Files
-  const [peers, setPeers] = useState<PeerInfo[]>([]);
-  const [selectedPeer, setSelectedPeer] = useState<PeerInfo | null>(null);
-  const [stagedFiles, setStagedFiles] = useState<StagedFile[]>([]);
-  const [isEncrypted, setIsEncrypted] = useState(true);
-  const [autoCloudSync, setAutoCloudSync] = useState(true);
-  const [encryptionPassphrase, setEncryptionPassphrase] = useState('');
-
-  // Active Transfer & Incoming Requests
+  // Transfers
   const [transferSession, setTransferSession] = useState<TransferSession | null>(null);
   const [incomingRequest, setIncomingRequest] = useState<IncomingTransferRequest | null>(null);
 
-  // Cloud Vault Files
-  const [cloudFiles, setCloudFiles] = useState<CloudVaultFile[]>([]);
-  const [isUploadingCloud, setIsUploadingCloud] = useState(false);
-
-  // References
+  // Refs
   const wsRef = useRef<WebSocket | null>(null);
   const webrtcRef = useRef<WebRTCConnection | null>(null);
-  const isPausedRef = useRef(false);
+  const pendingFilesRef = useRef<File[]>([]);
+  const targetPeerRef = useRef<PeerInfo | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const activeSessionRef = useRef<TransferSession | null>(null);
   activeSessionRef.current = transferSession;
+
+  // Share URL for mobile QR pairing
+  const shareUrl = typeof window !== 'undefined'
+    ? `${window.location.origin}${window.location.pathname}${roomCode !== 'global' ? `?room=${encodeURIComponent(roomCode)}` : ''}`
+    : '';
 
   // Sound toggle
   const handleToggleMute = () => {
@@ -112,50 +94,11 @@ export default function App() {
     }
   };
 
-  // Change room code
-  const handleChangeRoom = (newRoom: string) => {
-    setRoomCode(newRoom);
-    // update URL query param without reload
-    const url = new URL(window.location.href);
-    url.searchParams.set('room', newRoom);
-    window.history.replaceState({}, '', url.toString());
-
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
-        JSON.stringify({
-          type: 'join',
-          peerId,
-          name: deviceName,
-          deviceType: deviceInfo.deviceType,
-          os: deviceInfo.os,
-          roomCode: newRoom,
-        })
-      );
-    }
-  };
-
-  // Fetch Cloud Vault Files
-  const fetchCloudFiles = useCallback(async () => {
-    try {
-      const res = await fetch(`/api/vault/files?room=${encodeURIComponent(roomCode)}`);
-      if (res.ok) {
-        const data = await res.json();
-        setCloudFiles(data.files || []);
-      }
-    } catch (err) {
-      console.error('Error fetching vault files:', err);
-    }
-  }, [roomCode]);
-
-  useEffect(() => {
-    fetchCloudFiles();
-  }, [fetchCloudFiles]);
-
-  // WebSocket Connection Management
+  // WebSocket signaling
   useEffect(() => {
     let reconnectTimeout: any;
 
-    const connectWebSocket = () => {
+    const connect = () => {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${protocol}//${window.location.host}/ws`;
 
@@ -163,7 +106,6 @@ export default function App() {
       wsRef.current = ws;
 
       ws.onopen = () => {
-        // Register current peer in room
         ws.send(
           JSON.stringify({
             type: 'join',
@@ -206,9 +148,6 @@ export default function App() {
 
             case 'peer_left': {
               setPeers((prev) => prev.filter((p) => p.peerId !== msg.peerId));
-              if (selectedPeer?.peerId === msg.peerId) {
-                setSelectedPeer(null);
-              }
               break;
             }
 
@@ -220,15 +159,14 @@ export default function App() {
             }
 
             case 'transfer_request': {
-              // Incoming AirDrop Request
               setIncomingRequest({
                 transferId: msg.transferId,
                 fromPeerId: msg.fromPeerId,
                 sender: msg.sender,
                 files: msg.files,
                 totalSize: msg.totalSize,
-                isEncrypted: msg.isEncrypted,
-                authFingerprint: msg.authFingerprint,
+                isEncrypted: false,
+                authFingerprint: '',
               });
               playRequestChime();
               break;
@@ -238,24 +176,29 @@ export default function App() {
               const current = activeSessionRef.current;
               if (current && current.id === msg.transferId) {
                 if (msg.accepted) {
-                  // Recipient accepted! Start WebRTC connection as initiator
                   setTransferSession((prev) =>
                     prev ? { ...prev, status: 'connecting' } : null
                   );
-                  initiateSenderWebRTC(current);
+                  startSendingFiles(current);
                 } else {
                   setTransferSession((prev) =>
                     prev
                       ? {
                           ...prev,
                           status: 'rejected',
-                          errorMessage: msg.reason || 'Rechazado por el destinatario',
+                          errorMessage: msg.reason || 'Rechazado',
                         }
                       : null
                   );
                   playCancelTone();
                 }
               }
+              break;
+            }
+
+            case 'relay_chunk': {
+              // Fallback relay chunk receiver if WebRTC is bypassed
+              handleRelayChunkReceived(msg);
               break;
             }
 
@@ -278,74 +221,108 @@ export default function App() {
               break;
             }
 
-            case 'cloud_file_available': {
-              fetchCloudFiles();
-              break;
-            }
-
             default:
               break;
           }
         } catch (err) {
-          console.error('Error handling WS message:', err);
+          console.error(err);
         }
       };
 
       ws.onclose = () => {
-        reconnectTimeout = setTimeout(connectWebSocket, 2000);
-      };
-
-      ws.onerror = (err) => {
-        console.warn('WS error:', err);
+        reconnectTimeout = setTimeout(connect, 2000);
       };
     };
 
-    connectWebSocket();
+    connect();
 
     return () => {
       if (reconnectTimeout) clearTimeout(reconnectTimeout);
-      if (wsRef.current) {
-        wsRef.current.close();
-      }
+      if (wsRef.current) wsRef.current.close();
     };
-  }, [peerId, deviceName, deviceInfo, roomCode, fetchCloudFiles]);
+  }, [peerId, deviceName, deviceInfo, roomCode]);
 
-  // Stage Files handler
-  const handleAddFiles = async (files: FileList | File[]) => {
-    const list = Array.from(files);
-    const newStaged: StagedFile[] = list.map((file) => ({
-      id: Math.random().toString(36).substring(2, 9),
-      file,
-      name: file.name,
-      size: file.size,
-      type: file.type || 'application/octet-stream',
-      isHashing: true,
-    }));
-
-    setStagedFiles((prev) => [...prev, ...newStaged]);
-
-    // Compute SHA-256 for integrity verification
-    for (const item of newStaged) {
-      computeFileHash(item.file).then((hash) => {
-        setStagedFiles((prev) =>
-          prev.map((f) => (f.id === item.id ? { ...f, sha256: hash, isHashing: false } : f))
-        );
-      });
+  // Handle clicking a device to send files
+  const handleDeviceClick = (peer: PeerInfo) => {
+    targetPeerRef.current = peer;
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
+      fileInputRef.current.click();
     }
   };
 
-  const handleRemoveFile = (id: string) => {
-    setStagedFiles((prev) => prev.filter((f) => f.id !== id));
+  // Handle file picker selection
+  const handleFileInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0 && targetPeerRef.current) {
+      initiateTransferWithFiles(targetPeerRef.current, Array.from(e.target.files));
+    }
   };
 
-  const handleClearFiles = () => {
-    setStagedFiles([]);
+  // Handle drag-and-drop directly onto a device
+  const handleDropOnDevice = (peer: PeerInfo, fileList: FileList) => {
+    if (fileList.length > 0) {
+      initiateTransferWithFiles(peer, Array.from(fileList));
+    }
   };
 
-  // Initiate Sender WebRTC Transfer
-  const initiateSenderWebRTC = async (session: TransferSession) => {
-    const cryptoSecret = encryptionPassphrase || session.authFingerprint || roomCode;
-    const cryptoKey = session.isEncrypted ? await deriveKey(cryptoSecret) : null;
+  // Initiate transfer request
+  const initiateTransferWithFiles = (peer: PeerInfo, files: File[]) => {
+    pendingFilesRef.current = files;
+    const transferId = 'drop-' + Math.random().toString(36).substring(2, 9);
+    const totalSize = files.reduce((acc, f) => acc + f.size, 0);
+
+    const filesMeta = files.map((f) => ({
+      name: f.name,
+      size: f.size,
+      type: f.type || 'application/octet-stream',
+    }));
+
+    const session: TransferSession = {
+      id: transferId,
+      direction: 'send',
+      peerId: peer.peerId,
+      peerName: peer.name,
+      peerOs: peer.os,
+      peerDeviceType: peer.deviceType,
+      files: filesMeta,
+      currentFileIndex: 0,
+      totalSize,
+      transferredBytes: 0,
+      speedBps: 0,
+      etaSeconds: 0,
+      startTime: Date.now(),
+      status: 'waiting_accept',
+      isEncrypted: false,
+      authFingerprint: '',
+      transport: 'webrtc',
+    };
+
+    setTransferSession(session);
+
+    // Send transfer request via WebSocket
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'transfer_request',
+          targetPeerId: peer.peerId,
+          transferId,
+          senderName: deviceName,
+          senderOs: deviceInfo.os,
+          senderDeviceType: deviceInfo.deviceType,
+          files: filesMeta,
+          totalSize,
+          isEncrypted: false,
+        })
+      );
+    }
+  };
+
+  // Start sending files over WebRTC (with automatic relay fallback)
+  const startSendingFiles = async (session: TransferSession) => {
+    const files = pendingFilesRef.current;
+    if (files.length === 0) return;
+
+    let webrtcConnected = false;
 
     const webrtc = new WebRTCConnection(session.peerId, true, {
       onSignal: (signalData) => {
@@ -360,88 +337,75 @@ export default function App() {
         }
       },
       onChannelOpen: async () => {
+        webrtcConnected = true;
         setTransferSession((prev) =>
           prev ? { ...prev, status: 'transferring', startTime: Date.now() } : null
         );
-
-        // Start Streaming Files chunk-by-chunk!
-        await streamFilesToPeer(session, webrtc, cryptoKey);
+        await streamFilesWebRTC(session, webrtc, files);
       },
-      onChannelClose: () => {
-        console.log('Sender DataChannel closed');
-      },
-      onData: (data) => {
-        // Control messages from receiver if any
-      },
+      onChannelClose: () => {},
+      onData: () => {},
       onError: (err) => {
-        console.error('Sender WebRTC error:', err);
-        setTransferSession((prev) =>
-          prev ? { ...prev, status: 'error', errorMessage: 'Error de conexión WebRTC' } : null
-        );
+        console.warn('WebRTC fallback to relay:', err);
       },
     });
 
     webrtcRef.current = webrtc;
     await webrtc.createOffer();
+
+    // Fallback: If WebRTC DataChannel doesn't open within 3.2s, stream via WebSocket relay!
+    setTimeout(async () => {
+      if (!webrtcConnected && activeSessionRef.current?.status === 'connecting') {
+        console.log('Using WebSocket Relay fallback for guaranteed transfer');
+        setTransferSession((prev) =>
+          prev
+            ? { ...prev, status: 'transferring', transport: 'relay', startTime: Date.now() }
+            : null
+        );
+        await streamFilesRelay(session, files);
+      }
+    }, 3200);
   };
 
-  // Sender File Streaming Loop with Flow Control
-  const streamFilesToPeer = async (
+  // WebRTC Streamer
+  const streamFilesWebRTC = async (
     session: TransferSession,
     webrtc: WebRTCConnection,
-    cryptoKey: CryptoKey | null
+    files: File[]
   ) => {
     let totalBytesSent = 0;
     let lastTime = Date.now();
     let bytesSinceLastTime = 0;
 
-    for (let fIdx = 0; fIdx < stagedFiles.length; fIdx++) {
-      const staged = stagedFiles[fIdx];
-      const file = staged.file;
+    for (let fIdx = 0; fIdx < files.length; fIdx++) {
+      const file = files[fIdx];
       const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
 
-      // Send File Meta Header
       webrtc.send(
         JSON.stringify({
           type: 'file_start',
           fileIndex: fIdx,
-          totalFiles: stagedFiles.length,
+          totalFiles: files.length,
           name: file.name,
           size: file.size,
           mimeType: file.type || 'application/octet-stream',
-          sha256: staged.sha256,
-          isEncrypted: session.isEncrypted,
           totalChunks,
         })
       );
 
-      // Read & Send Chunks with Backpressure
       let offset = 0;
-      let chunkIndex = 0;
-
       while (offset < file.size) {
-        // Check pause state
-        while (isPausedRef.current) {
-          await new Promise((r) => setTimeout(r, 200));
-        }
+        if (activeSessionRef.current?.status === 'cancelled') return;
 
         const slice = file.slice(offset, offset + CHUNK_SIZE);
-        let buffer = await slice.arrayBuffer();
+        const buffer = await slice.arrayBuffer();
 
-        // Encrypt if AES-GCM enabled
-        if (cryptoKey) {
-          buffer = await encryptChunk(buffer, cryptoKey);
-        }
-
-        // Send binary buffer
         webrtc.send(buffer);
 
         offset += CHUNK_SIZE;
-        chunkIndex++;
         totalBytesSent += slice.size;
         bytesSinceLastTime += slice.size;
 
-        // Measure speed & ETA every 250ms
         const now = Date.now();
         const delta = (now - lastTime) / 1000;
         if (delta >= 0.25) {
@@ -465,21 +429,17 @@ export default function App() {
           bytesSinceLastTime = 0;
         }
 
-        // Backpressure flow control: wait for buffer to drain if needed
         await webrtc.waitForDrain();
       }
 
-      // Send File Complete Footer
       webrtc.send(
         JSON.stringify({
           type: 'file_end',
           fileIndex: fIdx,
-          sha256: staged.sha256,
         })
       );
     }
 
-    // All files sent!
     setTransferSession((prev) =>
       prev
         ? {
@@ -492,80 +452,153 @@ export default function App() {
         : null
     );
     playSuccessChime();
+  };
 
-    // If auto cloud sync is checked, also save to cloud vault
-    if (autoCloudSync) {
-      for (const staged of stagedFiles) {
-        uploadFileToVault(staged.file, staged.sha256);
+  // WebSocket Relay Streamer (Fallback)
+  const streamFilesRelay = async (session: TransferSession, files: File[]) => {
+    let totalBytesSent = 0;
+    let lastTime = Date.now();
+    let bytesSinceLastTime = 0;
+
+    for (let fIdx = 0; fIdx < files.length; fIdx++) {
+      const file = files[fIdx];
+      const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({
+            type: 'relay_chunk',
+            targetPeerId: session.peerId,
+            transferId: session.id,
+            fileIndex: fIdx,
+            data: JSON.stringify({
+              meta: true,
+              name: file.name,
+              size: file.size,
+              mimeType: file.type || 'application/octet-stream',
+              totalChunks,
+            }),
+          })
+        );
+      }
+
+      let offset = 0;
+      let chunkIdx = 0;
+
+      while (offset < file.size) {
+        if (activeSessionRef.current?.status === 'cancelled') return;
+
+        const slice = file.slice(offset, offset + CHUNK_SIZE);
+        const buffer = await slice.arrayBuffer();
+
+        // Convert buffer to binary string
+        let binary = '';
+        const bytes = new Uint8Array(buffer);
+        for (let i = 0; i < bytes.byteLength; i++) {
+          binary += String.fromCharCode(bytes[i]);
+        }
+        const base64 = btoa(binary);
+
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.send(
+            JSON.stringify({
+              type: 'relay_chunk',
+              targetPeerId: session.peerId,
+              transferId: session.id,
+              fileIndex: fIdx,
+              chunkIndex: chunkIdx,
+              totalChunks,
+              data: base64,
+            })
+          );
+        }
+
+        offset += CHUNK_SIZE;
+        chunkIdx++;
+        totalBytesSent += slice.size;
+        bytesSinceLastTime += slice.size;
+
+        const now = Date.now();
+        const delta = (now - lastTime) / 1000;
+        if (delta >= 0.25) {
+          const speedBps = bytesSinceLastTime / delta;
+          const remainingBytes = Math.max(0, session.totalSize - totalBytesSent);
+          const etaSeconds = speedBps > 0 ? remainingBytes / speedBps : 0;
+
+          setTransferSession((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  currentFileIndex: fIdx,
+                  transferredBytes: totalBytesSent,
+                  speedBps,
+                  etaSeconds,
+                }
+              : null
+          );
+
+          lastTime = now;
+          bytesSinceLastTime = 0;
+        }
+
+        await new Promise((r) => setTimeout(r, 12));
+      }
+
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({
+            type: 'relay_chunk',
+            targetPeerId: session.peerId,
+            transferId: session.id,
+            fileIndex: fIdx,
+            data: JSON.stringify({ end: true }),
+          })
+        );
       }
     }
+
+    setTransferSession((prev) =>
+      prev
+        ? {
+            ...prev,
+            status: 'completed',
+            transferredBytes: session.totalSize,
+            speedBps: 0,
+            etaSeconds: 0,
+          }
+        : null
+    );
+    playSuccessChime();
   };
 
-  // Start Transfer Request to Selected Peer
-  const handleStartP2PTransfer = () => {
-    if (!selectedPeer || stagedFiles.length === 0) return;
+  // Receiver State Buffers
+  const receiverBufferRef = useRef<{
+    chunks: ArrayBuffer[];
+    currentMeta: any;
+    totalReceived: number;
+    lastTime: number;
+    bytesSinceLast: number;
+  }>({
+    chunks: [],
+    currentMeta: null,
+    totalReceived: 0,
+    lastTime: Date.now(),
+    bytesSinceLast: 0,
+  });
 
-    const transferId = 'xfer-' + Math.random().toString(36).substring(2, 9);
-    const totalSize = stagedFiles.reduce((acc, f) => acc + f.size, 0);
-    const authFingerprint = generateSecurityFingerprint(peerId, selectedPeer.peerId, transferId);
-
-    const filesMeta = stagedFiles.map((f) => ({
-      name: f.name,
-      size: f.size,
-      type: f.type,
-      sha256: f.sha256,
-    }));
-
-    // Create session in 'waiting_accept'
-    const newSession: TransferSession = {
-      id: transferId,
-      direction: 'send',
-      peerId: selectedPeer.peerId,
-      peerName: selectedPeer.name,
-      peerOs: selectedPeer.os,
-      peerDeviceType: selectedPeer.deviceType,
-      files: filesMeta,
-      currentFileIndex: 0,
-      totalSize,
-      transferredBytes: 0,
-      speedBps: 0,
-      etaSeconds: 0,
-      startTime: Date.now(),
-      status: 'waiting_accept',
-      isEncrypted,
-      authFingerprint,
-      transport: 'webrtc',
-    };
-
-    setTransferSession(newSession);
-
-    // Send transfer request message to recipient via WebSocket
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
-        JSON.stringify({
-          type: 'transfer_request',
-          targetPeerId: selectedPeer.peerId,
-          transferId,
-          senderName: deviceName,
-          senderOs: deviceInfo.os,
-          senderDeviceType: deviceInfo.deviceType,
-          files: filesMeta,
-          totalSize,
-          isEncrypted,
-          authFingerprint,
-        })
-      );
-    }
-  };
-
-  // Recipient Accepts Transfer
-  const handleAcceptIncoming = async () => {
+  // Handle Accept Incoming Transfer
+  const handleAcceptIncoming = () => {
     if (!incomingRequest) return;
     const req = incomingRequest;
     setIncomingRequest(null);
 
-    const cryptoSecret = encryptionPassphrase || req.authFingerprint || roomCode;
-    const cryptoKey = req.isEncrypted ? await deriveKey(cryptoSecret) : null;
+    receiverBufferRef.current = {
+      chunks: [],
+      currentMeta: null,
+      totalReceived: 0,
+      lastTime: Date.now(),
+      bytesSinceLast: 0,
+    };
 
     const newSession: TransferSession = {
       id: req.transferId,
@@ -582,20 +615,14 @@ export default function App() {
       etaSeconds: 0,
       startTime: Date.now(),
       status: 'connecting',
-      isEncrypted: req.isEncrypted,
-      authFingerprint: req.authFingerprint,
+      isEncrypted: false,
+      authFingerprint: '',
       transport: 'webrtc',
     };
 
     setTransferSession(newSession);
 
-    // Receiver WebRTC connection
-    let receivedChunks: ArrayBuffer[] = [];
-    let currentMeta: any = null;
-    let totalBytesReceived = 0;
-    let lastTime = Date.now();
-    let bytesSinceLastTime = 0;
-
+    // Setup receiver WebRTC
     const webrtc = new WebRTCConnection(req.fromPeerId, false, {
       onSignal: (signalData) => {
         if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
@@ -613,100 +640,18 @@ export default function App() {
           prev ? { ...prev, status: 'transferring', startTime: Date.now() } : null
         );
       },
-      onChannelClose: () => {
-        console.log('Receiver DataChannel closed');
-      },
-      onData: async (data) => {
-        if (typeof data === 'string') {
-          try {
-            const meta = JSON.parse(data);
-            if (meta.type === 'file_start') {
-              currentMeta = meta;
-              receivedChunks = [];
-              setTransferSession((prev) =>
-                prev ? { ...prev, currentFileIndex: meta.fileIndex } : null
-              );
-            } else if (meta.type === 'file_end') {
-              // Assemble file and trigger browser download
-              if (currentMeta && receivedChunks.length > 0) {
-                const blob = new Blob(receivedChunks, { type: currentMeta.mimeType });
-                const downloadUrl = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = downloadUrl;
-                a.download = currentMeta.name;
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-                setTimeout(() => URL.revokeObjectURL(downloadUrl), 10000);
-
-                receivedChunks = [];
-              }
-
-              // Check if last file
-              if (currentMeta && currentMeta.fileIndex === req.files.length - 1) {
-                setTransferSession((prev) =>
-                  prev
-                    ? {
-                        ...prev,
-                        status: 'completed',
-                        transferredBytes: req.totalSize,
-                        speedBps: 0,
-                        etaSeconds: 0,
-                      }
-                    : null
-                );
-                playSuccessChime();
-              }
-            }
-          } catch (e) {
-            console.error('Error parsing channel JSON:', e);
-          }
-        } else if (data instanceof ArrayBuffer) {
-          // Binary chunk received!
-          let chunk = data;
-          if (cryptoKey) {
-            try {
-              chunk = await decryptChunk(data, cryptoKey);
-            } catch (err) {
-              console.error('Decryption error on chunk:', err);
-            }
-          }
-
-          receivedChunks.push(chunk);
-          totalBytesReceived += chunk.byteLength;
-          bytesSinceLastTime += chunk.byteLength;
-
-          const now = Date.now();
-          const delta = (now - lastTime) / 1000;
-          if (delta >= 0.25) {
-            const speedBps = bytesSinceLastTime / delta;
-            const remainingBytes = Math.max(0, req.totalSize - totalBytesReceived);
-            const etaSeconds = speedBps > 0 ? remainingBytes / speedBps : 0;
-
-            setTransferSession((prev) =>
-              prev
-                ? {
-                    ...prev,
-                    transferredBytes: totalBytesReceived,
-                    speedBps,
-                    etaSeconds,
-                  }
-                : null
-            );
-
-            lastTime = now;
-            bytesSinceLastTime = 0;
-          }
-        }
+      onChannelClose: () => {},
+      onData: (data) => {
+        handleReceiverData(data, req);
       },
       onError: (err) => {
-        console.error('Receiver WebRTC error:', err);
+        console.warn('Receiver WebRTC error:', err);
       },
     });
 
     webrtcRef.current = webrtc;
 
-    // Send transfer_response acceptance back to sender
+    // Send accept response
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(
         JSON.stringify({
@@ -719,7 +664,148 @@ export default function App() {
     }
   };
 
-  // Recipient Rejects Transfer
+  // Handle data received on receiver channel
+  const handleReceiverData = (data: string | ArrayBuffer, req: IncomingTransferRequest) => {
+    const buf = receiverBufferRef.current;
+
+    if (typeof data === 'string') {
+      try {
+        const meta = JSON.parse(data);
+        if (meta.type === 'file_start') {
+          buf.currentMeta = meta;
+          buf.chunks = [];
+          setTransferSession((prev) =>
+            prev ? { ...prev, currentFileIndex: meta.fileIndex } : null
+          );
+        } else if (meta.type === 'file_end') {
+          if (buf.currentMeta && buf.chunks.length > 0) {
+            triggerFileDownload(buf.chunks, buf.currentMeta.name, buf.currentMeta.mimeType);
+            buf.chunks = [];
+          }
+
+          if (buf.currentMeta && buf.currentMeta.fileIndex === req.files.length - 1) {
+            setTransferSession((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    status: 'completed',
+                    transferredBytes: req.totalSize,
+                    speedBps: 0,
+                    etaSeconds: 0,
+                  }
+                : null
+            );
+            playSuccessChime();
+          }
+        }
+      } catch (e) {
+        console.error(e);
+      }
+    } else if (data instanceof ArrayBuffer) {
+      buf.chunks.push(data);
+      buf.totalReceived += data.byteLength;
+      buf.bytesSinceLast += data.byteLength;
+
+      updateReceiverProgress(buf, req.totalSize);
+    }
+  };
+
+  // Relay chunk handler (Fallback)
+  const handleRelayChunkReceived = (msg: any) => {
+    const buf = receiverBufferRef.current;
+    const session = activeSessionRef.current;
+    if (!session || session.id !== msg.transferId) return;
+
+    if (session.status === 'connecting') {
+      setTransferSession((prev) =>
+        prev ? { ...prev, status: 'transferring', transport: 'relay' } : null
+      );
+    }
+
+    try {
+      if (typeof msg.data === 'string') {
+        if (msg.data.startsWith('{')) {
+          const parsed = JSON.parse(msg.data);
+          if (parsed.meta) {
+            buf.currentMeta = parsed;
+            buf.chunks = [];
+          } else if (parsed.end) {
+            if (buf.currentMeta && buf.chunks.length > 0) {
+              triggerFileDownload(buf.chunks, buf.currentMeta.name, buf.currentMeta.mimeType);
+              buf.chunks = [];
+            }
+            if (msg.fileIndex === session.files.length - 1) {
+              setTransferSession((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      status: 'completed',
+                      transferredBytes: session.totalSize,
+                      speedBps: 0,
+                      etaSeconds: 0,
+                    }
+                  : null
+              );
+              playSuccessChime();
+            }
+          }
+          return;
+        }
+
+        // Decode base64
+        const binary = atob(msg.data);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+          bytes[i] = binary.charCodeAt(i);
+        }
+        buf.chunks.push(bytes.buffer);
+        buf.totalReceived += bytes.byteLength;
+        buf.bytesSinceLast += bytes.byteLength;
+
+        updateReceiverProgress(buf, session.totalSize);
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const updateReceiverProgress = (buf: any, totalSize: number) => {
+    const now = Date.now();
+    const delta = (now - buf.lastTime) / 1000;
+    if (delta >= 0.25) {
+      const speedBps = buf.bytesSinceLast / delta;
+      const remainingBytes = Math.max(0, totalSize - buf.totalReceived);
+      const etaSeconds = speedBps > 0 ? remainingBytes / speedBps : 0;
+
+      setTransferSession((prev) =>
+        prev
+          ? {
+              ...prev,
+              transferredBytes: buf.totalReceived,
+              speedBps,
+              etaSeconds,
+            }
+          : null
+      );
+
+      buf.lastTime = now;
+      buf.bytesSinceLast = 0;
+    }
+  };
+
+  const triggerFileDownload = (chunks: ArrayBuffer[], filename: string, mimeType: string) => {
+    const blob = new Blob(chunks, { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  };
+
+  // Reject Incoming
   const handleRejectIncoming = () => {
     if (!incomingRequest) return;
     const req = incomingRequest;
@@ -732,34 +818,22 @@ export default function App() {
           targetPeerId: req.fromPeerId,
           transferId: req.transferId,
           accepted: false,
-          reason: 'Transferencia rechazada por el usuario',
+          reason: 'Rechazado',
         })
       );
     }
   };
 
-  // Transfer Modal Controls
-  const handlePauseTransfer = () => {
-    isPausedRef.current = true;
-    setTransferSession((prev) => (prev ? { ...prev, status: 'paused', speedBps: 0 } : null));
-  };
-
-  const handleResumeTransfer = () => {
-    isPausedRef.current = false;
-    setTransferSession((prev) => (prev ? { ...prev, status: 'transferring' } : null));
-  };
-
+  // Cancel Transfer
   const handleCancelTransfer = () => {
-    if (transferSession) {
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(
-          JSON.stringify({
-            type: 'transfer_cancel',
-            targetPeerId: transferSession.peerId,
-            transferId: transferSession.id,
-          })
-        );
-      }
+    if (transferSession && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(
+        JSON.stringify({
+          type: 'transfer_cancel',
+          targetPeerId: transferSession.peerId,
+          transferId: transferSession.id,
+        })
+      );
     }
     if (webrtcRef.current) {
       webrtcRef.current.close();
@@ -768,63 +842,7 @@ export default function App() {
     setTransferSession(null);
   };
 
-  // Cloud Vault Upload helper
-  const uploadFileToVault = async (file: File, sha256?: string) => {
-    setIsUploadingCloud(true);
-    try {
-      const buffer = await file.arrayBuffer();
-      // Base64 encode for simple JSON payload
-      let binary = '';
-      const bytes = new Uint8Array(buffer);
-      const len = bytes.byteLength;
-      for (let i = 0; i < len; i++) {
-        binary += String.fromCharCode(bytes[i]);
-      }
-      const base64Data = btoa(binary);
-
-      const res = await fetch('/api/vault/upload', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: file.name,
-          size: file.size,
-          mimeType: file.type || 'application/octet-stream',
-          isEncrypted,
-          sha256,
-          senderName: deviceName,
-          senderOs: deviceInfo.os,
-          roomCode,
-          base64Data,
-          expiryHours: 24,
-        }),
-      });
-
-      if (res.ok) {
-        fetchCloudFiles();
-      }
-    } catch (err) {
-      console.error('Error uploading to cloud vault:', err);
-    } finally {
-      setIsUploadingCloud(false);
-    }
-  };
-
-  const handleDirectCloudUpload = (file: File) => {
-    uploadFileToVault(file);
-  };
-
-  const handleDeleteVaultFile = async (id: string) => {
-    try {
-      const res = await fetch(`/api/vault/files/${id}`, { method: 'DELETE' });
-      if (res.ok) {
-        setCloudFiles((prev) => prev.filter((f) => f.id !== id));
-      }
-    } catch (err) {
-      console.error(err);
-    }
-  };
-
-  // Full-Screen Drag and Drop Handlers
+  // Drag and drop anywhere on the screen
   const handleScreenDragOver = (e: React.DragEvent) => {
     e.preventDefault();
     setIsDraggingOverScreen(true);
@@ -841,7 +859,10 @@ export default function App() {
     e.preventDefault();
     setIsDraggingOverScreen(false);
     if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      handleAddFiles(e.dataTransfer.files);
+      // If there is exactly 1 peer, drop sends directly to that peer!
+      if (peers.length === 1) {
+        initiateTransferWithFiles(peers[0], Array.from(e.dataTransfer.files));
+      }
     }
   };
 
@@ -852,165 +873,91 @@ export default function App() {
       onDrop={handleScreenDrop}
       className="min-h-screen flex flex-col bg-neutral-950 text-neutral-100 selection:bg-cyan-500/30 selection:text-cyan-200"
     >
-      {/* Full-Screen Drag-and-Drop Overlay */}
+      {/* Hidden File Picker Input */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        className="hidden"
+        onChange={handleFileInputChange}
+      />
+
+      {/* Screen Drag Overlay */}
       {isDraggingOverScreen && (
-        <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex flex-col items-center justify-center border-4 border-dashed border-cyan-400 p-8 pointer-events-none">
-          <div className="w-20 h-20 rounded-3xl bg-cyan-500/20 text-cyan-400 flex items-center justify-center animate-bounce">
-            <DownloadCloud className="w-10 h-10" />
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex flex-col items-center justify-center border-4 border-dashed border-cyan-400 p-8 pointer-events-none">
+          <div className="w-16 h-16 rounded-2xl bg-cyan-500/20 text-cyan-400 flex items-center justify-center animate-bounce">
+            <UploadCloud className="w-8 h-8" />
           </div>
-          <h2 className="mt-4 text-xl font-bold text-white tracking-tight">
-            Suelta los archivos aquí
-          </h2>
-          <p className="text-sm text-neutral-400 mt-1">
-            Se añadirán automáticamente a la lista de envío AirDrop P2P
-          </p>
+          <h3 className="mt-4 text-lg font-bold text-white tracking-tight">
+            {peers.length === 1
+              ? `Suelta para enviar a ${peers[0].name}`
+              : 'Suelta el archivo sobre el dispositivo deseado'}
+          </h3>
         </div>
       )}
 
-      {/* Top Bar Header */}
-      <Header
-        activeTab={activeTab}
-        setActiveTab={setActiveTab}
-        onOpenPairing={() => setIsPairingOpen(true)}
-        onOpenSettings={() => setIsSettingsOpen(true)}
+      {/* Simple Header */}
+      <SimpleHeader
         deviceName={deviceName}
+        onUpdateDeviceName={handleUpdateDeviceName}
         deviceOs={deviceInfo.os}
         deviceType={deviceInfo.deviceType}
-        roomCode={roomCode}
         isMuted={isMutedState}
         onToggleMute={handleToggleMute}
-        connectedPeersCount={peers.length}
+        onOpenQR={() => setIsQROpen(true)}
+        peersCount={peers.length}
       />
 
-      {/* Main Viewport */}
-      <main className="flex-1 w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
-        {activeTab === 'radar' ? (
-          <div className="space-y-8">
-            {/* AirDrop Radar */}
-            <div className="bg-neutral-900/40 border border-neutral-800/80 rounded-3xl p-6 relative overflow-hidden backdrop-blur-sm">
-              <div className="flex items-center justify-between pb-3 border-b border-neutral-800/60">
-                <div className="flex items-center gap-2">
-                  <Radio className="w-4 h-4 text-cyan-400" />
-                  <span className="text-xs font-semibold uppercase tracking-wider text-neutral-300">
-                    Radar de Proximidad y Red Local
-                  </span>
-                </div>
-                <div className="flex items-center gap-2 text-xs text-neutral-400">
-                  <span className="font-mono text-cyan-400">{peers.length}</span>
-                  <span>{peers.length === 1 ? 'dispositivo activo' : 'dispositivos activos'}</span>
-                </div>
-              </div>
-
-              <RadarView
-                peers={peers}
-                myDevice={{
-                  name: deviceName,
-                  os: deviceInfo.os,
-                  deviceType: deviceInfo.deviceType,
-                  roomCode,
-                }}
-                onSelectPeer={(peer) => setSelectedPeer(peer)}
-                onDropFilesOnPeer={(peer, files) => {
-                  setSelectedPeer(peer);
-                  handleAddFiles(files);
-                }}
-                onOpenPairing={() => setIsPairingOpen(true)}
-              />
-            </div>
-
-            {/* File Staging & Sending Hub */}
-            <FileStaging
-              stagedFiles={stagedFiles}
-              onAddFiles={handleAddFiles}
-              onRemoveFile={handleRemoveFile}
-              onClearFiles={handleClearFiles}
-              peers={peers}
-              selectedPeer={selectedPeer}
-              onSelectPeer={setSelectedPeer}
-              onSendP2P={handleStartP2PTransfer}
-              onUploadToCloud={() => {
-                if (stagedFiles.length > 0) {
-                  for (const f of stagedFiles) {
-                    uploadFileToVault(f.file, f.sha256);
-                  }
-                  setActiveTab('vault');
-                }
-              }}
-              isEncrypted={isEncrypted}
-              setIsEncrypted={setIsEncrypted}
-              autoCloudSync={autoCloudSync}
-              setAutoCloudSync={setAutoCloudSync}
-              isUploadingCloud={isUploadingCloud}
-            />
-          </div>
-        ) : (
-          /* Cloud Vault View */
-          <CloudVaultDrawer
-            files={cloudFiles}
-            onRefresh={fetchCloudFiles}
-            onDeleteFile={handleDeleteVaultFile}
-            onDirectUpload={handleDirectCloudUpload}
-            isUploading={isUploadingCloud}
-            roomCode={roomCode}
-          />
-        )}
+      {/* Center Stage: Simple Radar & Device Bubbles */}
+      <main className="flex-1 max-w-4xl w-full mx-auto flex items-center justify-center px-4">
+        <SimpleDeviceRadar
+          peers={peers}
+          myDevice={{
+            name: deviceName,
+            os: deviceInfo.os,
+            deviceType: deviceInfo.deviceType,
+            roomCode,
+          }}
+          onDeviceClick={handleDeviceClick}
+          onDropOnDevice={handleDropOnDevice}
+          onOpenQR={() => setIsQROpen(true)}
+          shareUrl={shareUrl}
+        />
       </main>
 
-      {/* Active Transfer Modal */}
+      {/* Real-time Transfer Card */}
       {transferSession && (
-        <TransferModal
+        <SimpleTransferCard
           session={transferSession}
-          onPause={handlePauseTransfer}
-          onResume={handleResumeTransfer}
           onCancel={handleCancelTransfer}
           onClose={() => setTransferSession(null)}
         />
       )}
 
-      {/* Incoming Request Prompt */}
+      {/* Incoming AirDrop Modal */}
       {incomingRequest && (
-        <IncomingModal
+        <SimpleIncomingModal
           request={incomingRequest}
           onAccept={handleAcceptIncoming}
           onReject={handleRejectIncoming}
         />
       )}
 
-      {/* Pairing & QR Code Modal */}
-      {isPairingOpen && (
-        <PairingModal
-          roomCode={roomCode}
-          onChangeRoom={handleChangeRoom}
-          onClose={() => setIsPairingOpen(false)}
+      {/* Mobile QR Pairing Modal */}
+      {isQROpen && (
+        <SimpleQRModal
+          shareUrl={shareUrl}
+          onClose={() => setIsQROpen(false)}
         />
       )}
 
-      {/* Settings & E2EE Key Modal */}
-      {isSettingsOpen && (
-        <SettingsModal
-          deviceName={deviceName}
-          onUpdateDeviceName={handleUpdateDeviceName}
-          encryptionPassphrase={encryptionPassphrase}
-          onUpdatePassphrase={setEncryptionPassphrase}
-          isMuted={isMutedState}
-          onToggleMute={handleToggleMute}
-          deviceOs={deviceInfo.os}
-          deviceType={deviceInfo.deviceType}
-          onClose={() => setIsSettingsOpen(false)}
-        />
-      )}
-
-      {/* Footer */}
-      <footer className="w-full border-t border-neutral-900 bg-neutral-950/60 py-4 text-center text-xs text-neutral-500">
-        <div className="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-2">
-          <span>DropLink P2P · Transferencia Cifrada Punto a Punto</span>
-          <div className="flex items-center gap-4 text-neutral-400">
-            <span>WebRTC DataChannel 64KB</span>
-            <span aria-hidden="true">·</span>
-            <span>AES-GCM 256 bits</span>
-            <span aria-hidden="true">·</span>
-            <span>Multiplataforma</span>
-          </div>
+      {/* Simple Footer */}
+      <footer className="w-full border-t border-neutral-900 bg-neutral-950/70 py-3 text-center text-xs text-neutral-500">
+        <div className="max-w-4xl mx-auto px-4 flex items-center justify-between">
+          <span>DropLink · Transferencia directa entre dispositivos</span>
+          <span className="text-neutral-400 font-mono text-[11px]">
+            {peers.length} {peers.length === 1 ? 'dispositivo cerca' : 'dispositivos cerca'}
+          </span>
         </div>
       </footer>
     </div>

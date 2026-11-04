@@ -8,6 +8,7 @@ export interface PeerInfo {
   os: DeviceOS;
   roomCode: string;
   joinedAt?: number;
+  transportType?: 'wifi' | 'bluetooth' | 'hybrid';
 }
 
 export interface StagedFile {

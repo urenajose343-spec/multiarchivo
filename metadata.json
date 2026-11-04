@@ -1,6 +1,6 @@
 {
   "name": "DropLink P2P - AirDrop Multiplataforma Seguro",
   "description": "Transferencia ultrarrápida y cifrada de archivos de gran tamaño punto a punto con radar P2P y sincronización automática en la nube.",
-  "requestFramePermissions": ["camera"],
+  "requestFramePermissions": ["camera", "bluetooth"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
