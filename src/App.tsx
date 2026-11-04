@@ -24,7 +24,6 @@ import { WebRTCConnection, CHUNK_SIZE } from './utils/webrtcClient';
 import { SimpleHeader } from './components/SimpleHeader';
 import { SimpleDeviceRadar } from './components/SimpleDeviceRadar';
 import { SimpleTransferCard } from './components/SimpleTransferCard';
-import { SimpleIncomingModal } from './components/SimpleIncomingModal';
 import { SimpleQRModal } from './components/SimpleQRModal';
 import {
   scanBluetoothDevice,
@@ -59,9 +58,9 @@ export default function App() {
   const [isQROpen, setIsQROpen] = useState(false);
   const [isDraggingOverScreen, setIsDraggingOverScreen] = useState(false);
 
-  // Transfers
+  // Transfers (auto-accepted without manual prompt)
   const [transferSession, setTransferSession] = useState<TransferSession | null>(null);
-  const [incomingRequest, setIncomingRequest] = useState<IncomingTransferRequest | null>(null);
+  const acceptTransferDirectlyRef = useRef<((req: IncomingTransferRequest) => void) | null>(null);
 
   // Refs
   const wsRef = useRef<WebSocket | null>(null);
@@ -194,16 +193,23 @@ export default function App() {
           }
 
           case 'transfer_request': {
-            setIncomingRequest({
+            const senderFromPeerId = msg.fromPeerId || msg.senderPeerId || msg.sender?.peerId;
+            const req: IncomingTransferRequest = {
               transferId: msg.transferId,
-              fromPeerId: msg.fromPeerId,
-              sender: msg.sender,
-              files: msg.files,
-              totalSize: msg.totalSize,
+              fromPeerId: senderFromPeerId,
+              sender: msg.sender || {
+                name: msg.senderName || 'Dispositivo',
+                os: msg.senderOs || 'other',
+                deviceType: msg.senderDeviceType || 'mobile',
+              },
+              files: msg.files || [],
+              totalSize: msg.totalSize || 0,
               isEncrypted: false,
               authFingerprint: '',
-            });
+            };
             playRequestChime();
+            // Auto-accept directly: no confirmation needed on the receiver device!
+            acceptTransferDirectlyRef.current?.(req);
             break;
           }
 
@@ -248,10 +254,6 @@ export default function App() {
                 webrtcRef.current = null;
               }
             }
-            if (incomingRequest && incomingRequest.transferId === msg.transferId) {
-              setIncomingRequest(null);
-              playCancelTone();
-            }
             break;
           }
 
@@ -262,7 +264,7 @@ export default function App() {
         console.error('Error handling message:', err);
       }
     },
-    [peerId, incomingRequest]
+    [peerId]
   );
 
   // Dual Signaling Lifecycle: WebSocket with HTTP Serverless Polling Fallback
@@ -528,7 +530,7 @@ export default function App() {
       speedBps: 0,
       etaSeconds: 0,
       startTime: Date.now(),
-      status: isBt ? 'transferring' : 'waiting_accept',
+      status: isBt ? 'transferring' : 'connecting',
       isEncrypted: false,
       authFingerprint: '',
       transport: isBt ? 'bluetooth' : 'webrtc',
@@ -544,9 +546,10 @@ export default function App() {
       return;
     }
 
-    // Send transfer request via unified signaling
+    // Send transfer request via unified signaling (auto-accepted by receiver)
     sendSignaling(peer.peerId, {
       type: 'transfer_request',
+      fromPeerId: peerId,
       transferId,
       senderName: deviceName,
       senderOs: deviceInfo.os,
@@ -806,12 +809,8 @@ export default function App() {
     bytesSinceLast: 0,
   });
 
-  // Handle Accept Incoming Transfer
-  const handleAcceptIncoming = () => {
-    if (!incomingRequest) return;
-    const req = incomingRequest;
-    setIncomingRequest(null);
-
+  // Auto-Accept and Initialize Receiver (No manual confirmation needed)
+  const acceptTransferDirectly = (req: IncomingTransferRequest) => {
     receiverBufferRef.current = {
       chunks: [],
       currentMeta: null,
@@ -866,13 +865,14 @@ export default function App() {
 
     webrtcRef.current = webrtc;
 
-    // Send accept response
+    // Send accept response immediately so sender streams without user confirmation
     sendSignaling(req.fromPeerId, {
       type: 'transfer_response',
       transferId: req.transferId,
       accepted: true,
     });
   };
+  acceptTransferDirectlyRef.current = acceptTransferDirectly;
 
   // Handle data received on receiver channel
   const handleReceiverData = (data: string | ArrayBuffer, req: IncomingTransferRequest) => {
@@ -1087,19 +1087,6 @@ export default function App() {
     }, 40);
   };
 
-  // Reject Incoming
-  const handleRejectIncoming = () => {
-    if (!incomingRequest) return;
-    const req = incomingRequest;
-    setIncomingRequest(null);
-
-    sendSignaling(req.fromPeerId, {
-      type: 'transfer_response',
-      transferId: req.transferId,
-      accepted: false,
-      reason: 'Rechazado',
-    });
-  };
 
   // Cancel Transfer
   const handleCancelTransfer = () => {
@@ -1221,14 +1208,6 @@ export default function App() {
         />
       )}
 
-      {/* Incoming AirDrop Modal */}
-      {incomingRequest && (
-        <SimpleIncomingModal
-          request={incomingRequest}
-          onAccept={handleAcceptIncoming}
-          onReject={handleRejectIncoming}
-        />
-      )}
 
       {/* Mobile QR Pairing Modal */}
       {isQROpen && (
