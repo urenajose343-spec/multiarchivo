@@ -9,13 +9,42 @@ import { TransferFileMeta, TransferSession } from '../types';
 export const CHUNK_SIZE = 64 * 1024; // 64 KB per chunk (optimal for WebRTC DataChannel)
 const BUFFERED_AMOUNT_THRESHOLD = 512 * 1024; // 512 KB backpressure threshold
 
-const ICE_SERVERS: RTCConfiguration = {
-  iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-    { urls: 'stun:stun2.l.google.com:19302' },
-  ],
-};
+// Read STUN / TURN servers from Vite or React App environment variables
+export function getIceServers(): RTCConfiguration {
+  const envStun =
+    (typeof import.meta !== 'undefined' &&
+      import.meta.env &&
+      (import.meta.env.VITE_STUN_SERVER || import.meta.env.REACT_APP_STUN_SERVER)) ||
+    (typeof process !== 'undefined' &&
+      process.env &&
+      (process.env.VITE_STUN_SERVER || process.env.REACT_APP_STUN_SERVER)) ||
+    '';
+
+  const defaultStuns = [
+    'stun:stun.l.google.com:19302',
+    'stun:stun1.l.google.com:19302',
+    'stun:stun2.l.google.com:19302',
+  ];
+
+  const configuredList = envStun
+    ? envStun
+        .split(',')
+        .map((s: string) => s.trim())
+        .filter(Boolean)
+        .map((url: string) => {
+          if (!url.startsWith('stun:') && !url.startsWith('turn:')) {
+            return `stun:${url}`;
+          }
+          return url;
+        })
+    : [];
+
+  const combined = Array.from(new Set([...configuredList, ...defaultStuns]));
+
+  return {
+    iceServers: combined.map((urls) => ({ urls })),
+  };
+}
 
 export class WebRTCConnection {
   pc: RTCPeerConnection | null = null;
@@ -52,7 +81,7 @@ export class WebRTCConnection {
 
   private init() {
     try {
-      this.pc = new RTCPeerConnection(ICE_SERVERS);
+      this.pc = new RTCPeerConnection(getIceServers());
 
       this.pc.onicecandidate = (event) => {
         if (event.candidate) {

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   DeviceOS,
   DeviceType,
@@ -92,155 +92,283 @@ export default function App() {
         })
       );
     }
+    // Also send to HTTP signaling heartbeat
+    fetch('/api/signaling/heartbeat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        peerId,
+        name: newName,
+        deviceType: deviceInfo.deviceType,
+        os: deviceInfo.os,
+        roomCode,
+      }),
+    }).catch(() => {});
   };
 
-  // WebSocket signaling
+  // Unified Signaling Sender: tries WebSocket first, falls back to HTTP Serverless Signaling (for Vercel)
+  const sendSignaling = useCallback((targetPeerId: string, message: any) => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ ...message, targetPeerId }));
+      return;
+    }
+    // Fallback to HTTP signaling (critical for Vercel where WebSockets are not persistent)
+    fetch('/api/signaling/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ targetPeerId, message }),
+    }).catch((err) => console.warn('HTTP signaling send error:', err));
+  }, []);
+
+  // Dispatcher for incoming signaling messages (both from WebSocket and HTTP polling)
+  const handleIncomingMessage = useCallback(
+    async (msg: any) => {
+      try {
+        switch (msg.type) {
+          case 'room_state': {
+            setPeers(msg.peers || []);
+            break;
+          }
+
+          case 'peer_joined': {
+            if (msg.peer.peerId !== peerId) {
+              setPeers((prev) => {
+                const filtered = prev.filter((p) => p.peerId !== msg.peer.peerId);
+                return [...filtered, msg.peer];
+              });
+              playRadarPing();
+            }
+            break;
+          }
+
+          case 'peer_updated': {
+            setPeers((prev) =>
+              prev.map((p) => (p.peerId === msg.peer.peerId ? { ...p, ...msg.peer } : p))
+            );
+            break;
+          }
+
+          case 'peer_left': {
+            setPeers((prev) => prev.filter((p) => p.peerId !== msg.peerId));
+            break;
+          }
+
+          case 'signal': {
+            if (webrtcRef.current) {
+              await webrtcRef.current.handleSignal(msg.signalData);
+            }
+            break;
+          }
+
+          case 'transfer_request': {
+            setIncomingRequest({
+              transferId: msg.transferId,
+              fromPeerId: msg.fromPeerId,
+              sender: msg.sender,
+              files: msg.files,
+              totalSize: msg.totalSize,
+              isEncrypted: false,
+              authFingerprint: '',
+            });
+            playRequestChime();
+            break;
+          }
+
+          case 'transfer_response': {
+            const current = activeSessionRef.current;
+            if (current && current.id === msg.transferId) {
+              if (msg.accepted) {
+                setTransferSession((prev) =>
+                  prev ? { ...prev, status: 'connecting' } : null
+                );
+                startSendingFiles(current);
+              } else {
+                setTransferSession((prev) =>
+                  prev
+                    ? {
+                        ...prev,
+                        status: 'rejected',
+                        errorMessage: msg.reason || 'Rechazado',
+                      }
+                    : null
+                );
+                playCancelTone();
+              }
+            }
+            break;
+          }
+
+          case 'relay_chunk': {
+            handleRelayChunkReceived(msg);
+            break;
+          }
+
+          case 'transfer_cancel': {
+            const current = activeSessionRef.current;
+            if (current && current.id === msg.transferId) {
+              setTransferSession((prev) =>
+                prev ? { ...prev, status: 'cancelled' } : null
+              );
+              playCancelTone();
+              if (webrtcRef.current) {
+                webrtcRef.current.close();
+                webrtcRef.current = null;
+              }
+            }
+            if (incomingRequest && incomingRequest.transferId === msg.transferId) {
+              setIncomingRequest(null);
+              playCancelTone();
+            }
+            break;
+          }
+
+          default:
+            break;
+        }
+      } catch (err) {
+        console.error('Error handling message:', err);
+      }
+    },
+    [peerId, incomingRequest]
+  );
+
+  // Dual Signaling Lifecycle: WebSocket with HTTP Serverless Polling Fallback
   useEffect(() => {
     let reconnectTimeout: any;
+    let pollInterval: any;
+    let peersInterval: any;
+    let heartbeatInterval: any;
+    let wsFailed = false;
 
-    const connect = () => {
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/ws`;
+    // Optional external signaling server from env
+    const customSignaling =
+      (typeof import.meta !== 'undefined' &&
+        import.meta.env &&
+        (import.meta.env.VITE_SIGNALING_SERVER || import.meta.env.REACT_APP_SIGNALING_SERVER)) ||
+      '';
 
-      const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        ws.send(
-          JSON.stringify({
-            type: 'join',
+    const startHttpPolling = () => {
+      // 1. Heartbeat
+      const sendHeartbeat = () => {
+        fetch('/api/signaling/heartbeat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
             peerId,
             name: deviceName,
             deviceType: deviceInfo.deviceType,
             os: deviceInfo.os,
             roomCode,
-          })
-        );
+          }),
+        }).catch(() => {});
       };
 
-      ws.onmessage = async (event) => {
+      // 2. Poll peer list
+      const fetchPeers = async () => {
         try {
-          const msg = JSON.parse(event.data);
-
-          switch (msg.type) {
-            case 'room_state': {
-              setPeers(msg.peers || []);
-              break;
-            }
-
-            case 'peer_joined': {
-              if (msg.peer.peerId !== peerId) {
-                setPeers((prev) => {
-                  const filtered = prev.filter((p) => p.peerId !== msg.peer.peerId);
-                  return [...filtered, msg.peer];
-                });
+          const res = await fetch(`/api/signaling/peers?room=${encodeURIComponent(roomCode)}`);
+          if (res.ok) {
+            const data = await res.json();
+            const filtered = (data.peers || []).filter((p: any) => p.peerId !== peerId);
+            setPeers((prev) => {
+              if (filtered.length > prev.length) {
                 playRadarPing();
               }
-              break;
-            }
-
-            case 'peer_updated': {
-              setPeers((prev) =>
-                prev.map((p) => (p.peerId === msg.peer.peerId ? { ...p, ...msg.peer } : p))
-              );
-              break;
-            }
-
-            case 'peer_left': {
-              setPeers((prev) => prev.filter((p) => p.peerId !== msg.peerId));
-              break;
-            }
-
-            case 'signal': {
-              if (webrtcRef.current) {
-                await webrtcRef.current.handleSignal(msg.signalData);
-              }
-              break;
-            }
-
-            case 'transfer_request': {
-              setIncomingRequest({
-                transferId: msg.transferId,
-                fromPeerId: msg.fromPeerId,
-                sender: msg.sender,
-                files: msg.files,
-                totalSize: msg.totalSize,
-                isEncrypted: false,
-                authFingerprint: '',
-              });
-              playRequestChime();
-              break;
-            }
-
-            case 'transfer_response': {
-              const current = activeSessionRef.current;
-              if (current && current.id === msg.transferId) {
-                if (msg.accepted) {
-                  setTransferSession((prev) =>
-                    prev ? { ...prev, status: 'connecting' } : null
-                  );
-                  startSendingFiles(current);
-                } else {
-                  setTransferSession((prev) =>
-                    prev
-                      ? {
-                          ...prev,
-                          status: 'rejected',
-                          errorMessage: msg.reason || 'Rechazado',
-                        }
-                      : null
-                  );
-                  playCancelTone();
-                }
-              }
-              break;
-            }
-
-            case 'relay_chunk': {
-              // Fallback relay chunk receiver if WebRTC is bypassed
-              handleRelayChunkReceived(msg);
-              break;
-            }
-
-            case 'transfer_cancel': {
-              const current = activeSessionRef.current;
-              if (current && current.id === msg.transferId) {
-                setTransferSession((prev) =>
-                  prev ? { ...prev, status: 'cancelled' } : null
-                );
-                playCancelTone();
-                if (webrtcRef.current) {
-                  webrtcRef.current.close();
-                  webrtcRef.current = null;
-                }
-              }
-              if (incomingRequest && incomingRequest.transferId === msg.transferId) {
-                setIncomingRequest(null);
-                playCancelTone();
-              }
-              break;
-            }
-
-            default:
-              break;
+              return filtered;
+            });
           }
-        } catch (err) {
-          console.error(err);
+        } catch (e) {
+          // ignore
         }
       };
 
-      ws.onclose = () => {
-        reconnectTimeout = setTimeout(connect, 2000);
+      // 3. Poll queued messages
+      const pollMessages = async () => {
+        try {
+          const res = await fetch(`/api/signaling/poll?peerId=${encodeURIComponent(peerId)}`);
+          if (res.ok) {
+            const data = await res.json();
+            if (data.messages && data.messages.length > 0) {
+              for (const m of data.messages) {
+                handleIncomingMessage(m);
+              }
+            }
+          }
+        } catch (e) {
+          // ignore
+        }
       };
+
+      sendHeartbeat();
+      fetchPeers();
+      pollMessages();
+
+      heartbeatInterval = setInterval(sendHeartbeat, 5000);
+      peersInterval = setInterval(fetchPeers, 3000);
+      pollInterval = setInterval(pollMessages, 1200);
     };
 
-    connect();
+    const connectWebSocket = () => {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = customSignaling || `${protocol}//${window.location.host}/ws`;
+
+      try {
+        const ws = new WebSocket(wsUrl);
+        wsRef.current = ws;
+
+        ws.onopen = () => {
+          wsFailed = false;
+          ws.send(
+            JSON.stringify({
+              type: 'join',
+              peerId,
+              name: deviceName,
+              deviceType: deviceInfo.deviceType,
+              os: deviceInfo.os,
+              roomCode,
+            })
+          );
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const msg = JSON.parse(event.data);
+            handleIncomingMessage(msg);
+          } catch (e) {
+            console.error(e);
+          }
+        };
+
+        ws.onerror = () => {
+          if (!wsFailed) {
+            wsFailed = true;
+            // Activate HTTP polling fallback immediately
+            startHttpPolling();
+          }
+        };
+
+        ws.onclose = () => {
+          if (!wsFailed) {
+            wsFailed = true;
+            startHttpPolling();
+          }
+          reconnectTimeout = setTimeout(connectWebSocket, 4000);
+        };
+      } catch (err) {
+        startHttpPolling();
+      }
+    };
+
+    connectWebSocket();
 
     return () => {
       if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      if (pollInterval) clearInterval(pollInterval);
+      if (peersInterval) clearInterval(peersInterval);
+      if (heartbeatInterval) clearInterval(heartbeatInterval);
       if (wsRef.current) wsRef.current.close();
     };
-  }, [peerId, deviceName, deviceInfo, roomCode]);
+  }, [peerId, deviceName, deviceInfo, roomCode, handleIncomingMessage]);
 
   // Handle clicking a device to send files
   const handleDeviceClick = (peer: PeerInfo) => {
@@ -299,22 +427,17 @@ export default function App() {
 
     setTransferSession(session);
 
-    // Send transfer request via WebSocket
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
-        JSON.stringify({
-          type: 'transfer_request',
-          targetPeerId: peer.peerId,
-          transferId,
-          senderName: deviceName,
-          senderOs: deviceInfo.os,
-          senderDeviceType: deviceInfo.deviceType,
-          files: filesMeta,
-          totalSize,
-          isEncrypted: false,
-        })
-      );
-    }
+    // Send transfer request via unified signaling
+    sendSignaling(peer.peerId, {
+      type: 'transfer_request',
+      transferId,
+      senderName: deviceName,
+      senderOs: deviceInfo.os,
+      senderDeviceType: deviceInfo.deviceType,
+      files: filesMeta,
+      totalSize,
+      isEncrypted: false,
+    });
   };
 
   // Start sending files over WebRTC (with automatic relay fallback)
@@ -326,15 +449,10 @@ export default function App() {
 
     const webrtc = new WebRTCConnection(session.peerId, true, {
       onSignal: (signalData) => {
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-          wsRef.current.send(
-            JSON.stringify({
-              type: 'signal',
-              targetPeerId: session.peerId,
-              signalData,
-            })
-          );
-        }
+        sendSignaling(session.peerId, {
+          type: 'signal',
+          signalData,
+        });
       },
       onChannelOpen: async () => {
         webrtcConnected = true;
@@ -353,10 +471,10 @@ export default function App() {
     webrtcRef.current = webrtc;
     await webrtc.createOffer();
 
-    // Fallback: If WebRTC DataChannel doesn't open within 3.2s, stream via WebSocket relay!
+    // Fallback: If WebRTC DataChannel doesn't open within 3.5s, stream via relay!
     setTimeout(async () => {
       if (!webrtcConnected && activeSessionRef.current?.status === 'connecting') {
-        console.log('Using WebSocket Relay fallback for guaranteed transfer');
+        console.log('Using Relay fallback for guaranteed transfer');
         setTransferSession((prev) =>
           prev
             ? { ...prev, status: 'transferring', transport: 'relay', startTime: Date.now() }
@@ -364,7 +482,7 @@ export default function App() {
         );
         await streamFilesRelay(session, files);
       }
-    }, 3200);
+    }, 3500);
   };
 
   // WebRTC Streamer
@@ -454,7 +572,7 @@ export default function App() {
     playSuccessChime();
   };
 
-  // WebSocket Relay Streamer (Fallback)
+  // Relay Streamer (Fallback)
   const streamFilesRelay = async (session: TransferSession, files: File[]) => {
     let totalBytesSent = 0;
     let lastTime = Date.now();
@@ -464,23 +582,18 @@ export default function App() {
       const file = files[fIdx];
       const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
 
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(
-          JSON.stringify({
-            type: 'relay_chunk',
-            targetPeerId: session.peerId,
-            transferId: session.id,
-            fileIndex: fIdx,
-            data: JSON.stringify({
-              meta: true,
-              name: file.name,
-              size: file.size,
-              mimeType: file.type || 'application/octet-stream',
-              totalChunks,
-            }),
-          })
-        );
-      }
+      sendSignaling(session.peerId, {
+        type: 'relay_chunk',
+        transferId: session.id,
+        fileIndex: fIdx,
+        data: JSON.stringify({
+          meta: true,
+          name: file.name,
+          size: file.size,
+          mimeType: file.type || 'application/octet-stream',
+          totalChunks,
+        }),
+      });
 
       let offset = 0;
       let chunkIdx = 0;
@@ -499,19 +612,14 @@ export default function App() {
         }
         const base64 = btoa(binary);
 
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-          wsRef.current.send(
-            JSON.stringify({
-              type: 'relay_chunk',
-              targetPeerId: session.peerId,
-              transferId: session.id,
-              fileIndex: fIdx,
-              chunkIndex: chunkIdx,
-              totalChunks,
-              data: base64,
-            })
-          );
-        }
+        sendSignaling(session.peerId, {
+          type: 'relay_chunk',
+          transferId: session.id,
+          fileIndex: fIdx,
+          chunkIndex: chunkIdx,
+          totalChunks,
+          data: base64,
+        });
 
         offset += CHUNK_SIZE;
         chunkIdx++;
@@ -541,20 +649,15 @@ export default function App() {
           bytesSinceLastTime = 0;
         }
 
-        await new Promise((r) => setTimeout(r, 12));
+        await new Promise((r) => setTimeout(r, 15));
       }
 
-      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-        wsRef.current.send(
-          JSON.stringify({
-            type: 'relay_chunk',
-            targetPeerId: session.peerId,
-            transferId: session.id,
-            fileIndex: fIdx,
-            data: JSON.stringify({ end: true }),
-          })
-        );
-      }
+      sendSignaling(session.peerId, {
+        type: 'relay_chunk',
+        transferId: session.id,
+        fileIndex: fIdx,
+        data: JSON.stringify({ end: true }),
+      });
     }
 
     setTransferSession((prev) =>
@@ -625,15 +728,10 @@ export default function App() {
     // Setup receiver WebRTC
     const webrtc = new WebRTCConnection(req.fromPeerId, false, {
       onSignal: (signalData) => {
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-          wsRef.current.send(
-            JSON.stringify({
-              type: 'signal',
-              targetPeerId: req.fromPeerId,
-              signalData,
-            })
-          );
-        }
+        sendSignaling(req.fromPeerId, {
+          type: 'signal',
+          signalData,
+        });
       },
       onChannelOpen: () => {
         setTransferSession((prev) =>
@@ -652,16 +750,11 @@ export default function App() {
     webrtcRef.current = webrtc;
 
     // Send accept response
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
-        JSON.stringify({
-          type: 'transfer_response',
-          targetPeerId: req.fromPeerId,
-          transferId: req.transferId,
-          accepted: true,
-        })
-      );
-    }
+    sendSignaling(req.fromPeerId, {
+      type: 'transfer_response',
+      transferId: req.transferId,
+      accepted: true,
+    });
   };
 
   // Handle data received on receiver channel
@@ -811,29 +904,21 @@ export default function App() {
     const req = incomingRequest;
     setIncomingRequest(null);
 
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
-        JSON.stringify({
-          type: 'transfer_response',
-          targetPeerId: req.fromPeerId,
-          transferId: req.transferId,
-          accepted: false,
-          reason: 'Rechazado',
-        })
-      );
-    }
+    sendSignaling(req.fromPeerId, {
+      type: 'transfer_response',
+      transferId: req.transferId,
+      accepted: false,
+      reason: 'Rechazado',
+    });
   };
 
   // Cancel Transfer
   const handleCancelTransfer = () => {
-    if (transferSession && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
-        JSON.stringify({
-          type: 'transfer_cancel',
-          targetPeerId: transferSession.peerId,
-          transferId: transferSession.id,
-        })
-      );
+    if (transferSession) {
+      sendSignaling(transferSession.peerId, {
+        type: 'transfer_cancel',
+        transferId: transferSession.id,
+      });
     }
     if (webrtcRef.current) {
       webrtcRef.current.close();

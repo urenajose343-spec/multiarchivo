@@ -165,6 +165,87 @@ app.delete('/api/vault/files/:id', (req: Request, res: Response) => {
   res.json({ success: true });
 });
 
+// HTTP Signaling Fallback endpoints (useful for serverless or when WebSockets fail)
+interface HttpPeer {
+  peerId: string;
+  name: string;
+  deviceType: 'desktop' | 'mobile' | 'tablet';
+  os: 'ios' | 'android' | 'macos' | 'windows' | 'linux' | 'other';
+  roomCode: string;
+  lastSeen: number;
+}
+const httpPeers = new Map<string, HttpPeer>();
+const messageQueues = new Map<string, any[]>();
+
+app.post('/api/signaling/heartbeat', (req: Request, res: Response) => {
+  const { peerId, name, deviceType, os, roomCode } = req.body;
+  if (!peerId) return res.status(400).json({ error: 'peerId required' });
+  httpPeers.set(peerId, {
+    peerId,
+    name: name || 'Dispositivo',
+    deviceType: deviceType || 'desktop',
+    os: os || 'other',
+    roomCode: roomCode || 'global',
+    lastSeen: Date.now(),
+  });
+  res.json({ ok: true });
+});
+
+app.get('/api/signaling/peers', (req: Request, res: Response) => {
+  const room = (req.query.room as string) || 'global';
+  const now = Date.now();
+  const active: any[] = [];
+  for (const [id, p] of httpPeers.entries()) {
+    if (now - p.lastSeen < 15000 && p.roomCode === room) {
+      active.push(p);
+    } else if (now - p.lastSeen >= 35000) {
+      httpPeers.delete(id);
+      messageQueues.delete(id);
+    }
+  }
+
+  // Also include WebSocket peers if any!
+  const wsPeers = getRoomPeers(room);
+  const combinedMap = new Map();
+  for (const p of active) combinedMap.set(p.peerId, p);
+  for (const p of wsPeers) combinedMap.set(p.peerId, p);
+
+  res.json({ peers: Array.from(combinedMap.values()) });
+});
+
+app.post('/api/signaling/send', (req: Request, res: Response) => {
+  const { targetPeerId, message } = req.body;
+  if (!targetPeerId || !message) {
+    return res.status(400).json({ error: 'targetPeerId and message required' });
+  }
+
+  // If target peer is on WebSocket, deliver immediately
+  const wsPeer = peers.get(targetPeerId);
+  if (wsPeer && wsPeer.ws.readyState === WebSocket.OPEN) {
+    wsPeer.ws.send(JSON.stringify(message));
+    return res.json({ deliveredVia: 'websocket' });
+  }
+
+  // Otherwise queue in memory for HTTP polling
+  if (!messageQueues.has(targetPeerId)) {
+    messageQueues.set(targetPeerId, []);
+  }
+  messageQueues.get(targetPeerId)!.push(message);
+  res.json({ deliveredVia: 'queue' });
+});
+
+app.get('/api/signaling/poll', (req: Request, res: Response) => {
+  const peerId = req.query.peerId as string;
+  if (!peerId) return res.status(400).json({ error: 'peerId required' });
+
+  const peer = httpPeers.get(peerId);
+  if (peer) peer.lastSeen = Date.now();
+
+  const queue = messageQueues.get(peerId) || [];
+  messageQueues.set(peerId, []);
+  res.json({ messages: queue });
+});
+
 // WebSocket Signaling Server for WebRTC P2P AirDrop
 interface Peer {
   ws: WebSocket;
