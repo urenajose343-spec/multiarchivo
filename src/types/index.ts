@@ -57,8 +57,10 @@ export interface TransferSession {
   status: TransferStatus;
   errorMessage?: string;
   isEncrypted: boolean;
-  authFingerprint: string;
+  authFingerprint?: string;
   transport: 'webrtc' | 'relay' | 'bluetooth';
+  downloadUrl?: string;
+  downloadName?: string;
 }
 
 export interface IncomingTransferRequest {

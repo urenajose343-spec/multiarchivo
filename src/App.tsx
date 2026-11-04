@@ -70,8 +70,9 @@ export default function App() {
   const targetPeerRef = useRef<PeerInfo | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const activeSessionRef = useRef<TransferSession | null>(null);
-  activeSessionRef.current = transferSession;
   const bluetoothDevicesRef = useRef<Map<string, BluetoothDeviceInfo>>(new Map());
+  const activeBlobUrlsRef = useRef<string[]>([]);
+  activeSessionRef.current = transferSession;
 
   // Bluetooth Scanner
   const handleScanBluetooth = async () => {
@@ -887,12 +888,20 @@ export default function App() {
             prev ? { ...prev, currentFileIndex: meta.fileIndex } : null
           );
         } else if (meta.type === 'file_end') {
-          if (buf.currentMeta && buf.chunks.length > 0) {
-            triggerFileDownload(buf.chunks, buf.currentMeta.name, buf.currentMeta.mimeType);
-            buf.chunks = [];
-          }
+          const isLastFile =
+            buf.currentMeta && buf.currentMeta.fileIndex === req.files.length - 1;
 
-          if (buf.currentMeta && buf.currentMeta.fileIndex === req.files.length - 1) {
+          if (buf.currentMeta && buf.chunks.length > 0) {
+            const chunksCopy = buf.chunks;
+            buf.chunks = [];
+            finishReceivingFile(
+              chunksCopy,
+              buf.currentMeta.name,
+              buf.currentMeta.mimeType,
+              isLastFile,
+              req.totalSize
+            );
+          } else if (isLastFile) {
             setTransferSession((prev) =>
               prev
                 ? {
@@ -939,11 +948,18 @@ export default function App() {
             buf.currentMeta = parsed;
             buf.chunks = [];
           } else if (parsed.end) {
+            const isLastFile = msg.fileIndex === session.files.length - 1;
             if (buf.currentMeta && buf.chunks.length > 0) {
-              triggerFileDownload(buf.chunks, buf.currentMeta.name, buf.currentMeta.mimeType);
+              const chunksCopy = buf.chunks;
               buf.chunks = [];
-            }
-            if (msg.fileIndex === session.files.length - 1) {
+              finishReceivingFile(
+                chunksCopy,
+                buf.currentMeta.name,
+                buf.currentMeta.mimeType,
+                isLastFile,
+                session.totalSize
+              );
+            } else if (isLastFile) {
               setTransferSession((prev) =>
                 prev
                   ? {
@@ -963,8 +979,9 @@ export default function App() {
 
         // Decode base64
         const binary = atob(msg.data);
-        const bytes = new Uint8Array(binary.length);
-        for (let i = 0; i < binary.length; i++) {
+        const len = binary.length;
+        const bytes = new Uint8Array(len);
+        for (let i = 0; i < len; i++) {
           bytes[i] = binary.charCodeAt(i);
         }
         buf.chunks.push(bytes.buffer);
@@ -1002,16 +1019,72 @@ export default function App() {
     }
   };
 
-  const triggerFileDownload = (chunks: ArrayBuffer[], filename: string, mimeType: string) => {
-    const blob = new Blob(chunks, { type: mimeType });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  // Asynchronous non-blocking file assembly & download to prevent tab freeze
+  const finishReceivingFile = (
+    chunks: ArrayBuffer[],
+    filename: string,
+    mimeType: string,
+    isLastFile: boolean,
+    totalExpectedSize: number
+  ) => {
+    // 1. Immediately reflect 100% completed status in UI to prevent freezing
+    if (isLastFile) {
+      setTransferSession((prev) =>
+        prev
+          ? {
+              ...prev,
+              status: 'completed',
+              transferredBytes: totalExpectedSize,
+              speedBps: 0,
+              etaSeconds: 0,
+            }
+          : null
+      );
+      playSuccessChime();
+    }
+
+    // 2. Yield to the event loop so the UI renders smoothly before allocating the Blob
+    setTimeout(() => {
+      try {
+        if (!chunks || chunks.length === 0) return;
+        const blob = new Blob(chunks, { type: mimeType || 'application/octet-stream' });
+        const url = URL.createObjectURL(blob);
+        activeBlobUrlsRef.current.push(url);
+
+        // Store direct download URL on the session so the receiver card allows immediate 1-tap download
+        setTransferSession((prev) =>
+          prev
+            ? {
+                ...prev,
+                downloadUrl: url,
+                downloadName: filename,
+              }
+            : null
+        );
+
+        // 3. Initiate non-blocking background auto-download
+        setTimeout(() => {
+          try {
+            const a = document.createElement('a');
+            a.style.display = 'none';
+            a.href = url;
+            a.download = filename;
+            a.rel = 'noopener';
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(() => {
+              if (document.body.contains(a)) {
+                document.body.removeChild(a);
+              }
+            }, 3000);
+          } catch (autoErr) {
+            console.warn('Auto download blocked by browser policy:', autoErr);
+          }
+        }, 120);
+      } catch (err) {
+        console.error('Error assembling received file chunks:', err);
+      }
+    }, 40);
   };
 
   // Reject Incoming
@@ -1040,6 +1113,17 @@ export default function App() {
       webrtcRef.current.close();
       webrtcRef.current = null;
     }
+    handleCloseTransfer();
+  };
+
+  // Close / Dismiss Transfer Card & Clean up Object URLs safely
+  const handleCloseTransfer = () => {
+    activeBlobUrlsRef.current.forEach((url) => {
+      try {
+        URL.revokeObjectURL(url);
+      } catch (e) {}
+    });
+    activeBlobUrlsRef.current = [];
     setTransferSession(null);
   };
 
@@ -1133,7 +1217,7 @@ export default function App() {
         <SimpleTransferCard
           session={transferSession}
           onCancel={handleCancelTransfer}
-          onClose={() => setTransferSession(null)}
+          onClose={handleCloseTransfer}
         />
       )}
 

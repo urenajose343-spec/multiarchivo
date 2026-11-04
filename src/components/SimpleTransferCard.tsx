@@ -2,7 +2,7 @@ import React from 'react';
 import { TransferSession } from '../types';
 import { formatBytes, formatSpeed, truncateFilename } from '../utils/formatters';
 import { FileTypeIcon, DeviceIcon } from './DeviceIcons';
-import { X, CheckCircle, AlertCircle, ArrowUpRight, ArrowDownLeft } from 'lucide-react';
+import { X, CheckCircle, AlertCircle, ArrowUpRight, ArrowDownLeft, Download } from 'lucide-react';
 
 interface SimpleTransferCardProps {
   session: TransferSession;
@@ -125,6 +125,20 @@ export function SimpleTransferCard({
             </span>
           )}
         </div>
+
+        {/* Action Button for Received Files */}
+        {isCompleted && session.direction === 'receive' && session.downloadUrl && (
+          <div className="mt-3 pt-2.5 border-t border-neutral-800/80">
+            <a
+              href={session.downloadUrl}
+              download={session.downloadName || currentFile?.name || 'archivo'}
+              className="w-full flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-neutral-950 font-semibold text-xs transition-colors shadow-sm cursor-pointer"
+            >
+              <Download className="w-3.5 h-3.5" />
+              Guardar archivo en este dispositivo
+            </a>
+          </div>
+        )}
       </div>
     </div>
   );
